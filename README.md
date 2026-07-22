@@ -46,5 +46,5 @@ whose transform values need review.
 
 ### Controller Naming
 
-Checks controller names against a suffix entered in the UI, such as `_CTRL`.
+Checks controller names against a suffix, a prefix or both entered in the UI, such as `_CTRL`, 'l_' .
 
