@@ -1,7 +1,7 @@
 # Maya Rig Validator
 
 A PySide6 validation tool for Autodesk Maya that helps identify common rigging
-scene issues before handoff or export.
+scene issues.
 
 ## Features
 
