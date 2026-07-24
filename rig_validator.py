@@ -3,6 +3,7 @@ from maya import OpenMayaUI as omui
 from shiboken6 import wrapInstance
 import maya.cmds as cmds
 import maya.api.OpenMaya as om
+import math
 
 
 WINDOW_NAME = "RigValidatorWindow"
@@ -376,9 +377,8 @@ class RigValidatorWindow(QtWidgets.QDialog):
             "Status: Scene changed. Run a new scan."
         )
 
-    def mark_results_stale(self):
+    def mark_results_stale(self, reason = "Scene data changed"):
         """Mark table results as outdated and prevent unsafe fixes."""
-        reason="Scene data changed"
         if self.ignore_scene_changes:
             return
         if self.result_table.rowCount() == 0:
@@ -782,33 +782,46 @@ class RigValidatorWindow(QtWidgets.QDialog):
 
         return issue_count
 
+
+    
     def find_invalid_controller_transforms(self):
-        """Return controllers with non-default transforms."""
         invalid_controllers = {}
-        expected_values = {
-            "translateX": 0,
-            "translateY": 0,
-            "translateZ": 0,
-            "rotateX": 0,
-            "rotateY": 0,
-            "rotateZ": 0,
-            "scaleX": 1,
-            "scaleY": 1,
-            "scaleZ": 1,
-        }
 
         for controller in find_controllers():
-            errors = []
-            for attribute, expected_value in expected_values.items():
-                current_value = cmds.getAttr(
-                    f"{controller}.{attribute}"
-                )
-                if current_value != expected_value:
-                    errors.append(f"{attribute} = {current_value}")
+            selection = om.MSelectionList()
+            selection.add(controller)
 
+            controller_path = selection.getDagPath(0)
+
+            transform_fn = om.MFnTransform(controller_path)
+
+            translation = transform_fn.translation(om.MSpace.kTransform)
+            rotation = transform_fn.rotation()
+            scale = transform_fn.scale()
+
+            errors = []
+            if translation.x != 0:
+                errors.append(f"translateX = {translation.x}")
+            if translation.y != 0:
+                errors.append(f"translateY = {translation.y}")
+            if translation.z != 0:
+                errors.append(f"translateZ = {translation.z}")
+            if rotation.x != 0:
+                errors.append(f"rotateX = {math.degrees(rotation.x)}")
+            if rotation.y != 0:
+                errors.append(f"rotateY = {math.degrees(rotation.y)}")
+            if rotation.z != 0:
+                errors.append(f"rotateZ = {math.degrees(rotation.z)}")
+            if scale[0] != 1:
+                errors.append(f"scaleX = {scale[0]}")
+            if scale[1] != 1:
+                errors.append(f"scaleY = {scale[1]}")
+            if scale[2] != 1:
+                errors.append(f"scaleZ = {scale[2]}")
+            
             if errors:
                 invalid_controllers[controller] = errors
-
+        
         return invalid_controllers
 
     def handle_table_double_click(self, row, column):
@@ -821,6 +834,8 @@ class RigValidatorWindow(QtWidgets.QDialog):
                     return
 
         self.select_result(row)
+
+
 
     def select_result(self, row):
         """Select the Maya node stored in a result row."""
@@ -998,39 +1013,63 @@ def find_duplicate_names():
 
     return duplicate_names
 
+def find_duplicate_names():
+
+    all_nodes = om.MItDag()
+    name_map = {}
+    
+    while not all_nodes.isDone():
+        dag_path = all_nodes.getPath()
+
+        short = dag_path.fullPathName().split("|")[-1]
+        long = dag_path.fullPathName()
+
+        if short not in name_map:
+            name_map[short] = []
+        name_map[short].append(long)
+
+        all_nodes.next()
+
+    duplicate_names = {}
+    for short_name, paths in name_map.items():
+        if len(paths) > 1:
+            duplicate_names[short_name] = paths
+
+    return duplicate_names
 
 
 def find_meshes():
     """Return unique transforms that own non-intermediate mesh shapes."""
-    mesh_shapes = cmds.ls(
-        type="mesh",
-        long=True,
-        noIntermediate=True,
-    ) or []
+    iterator = om.MItDag(
+        om.MItDag.kDepthFirst,
+        om.MFn.kMesh,
+    )
 
     mesh_transforms = []
     seen_transforms = set()
 
-    for mesh_shape in mesh_shapes:
-        parents = cmds.listRelatives(
-            mesh_shape,
-            parent=True,
-            fullPath=True,
-        ) or []
+    while not iterator.isDone():
+        dag_path = iterator.getPath()
 
-        if not parents:
+        mesh_fn = om.MFnDagNode(dag_path)
+        #check the intermediate object status of the mesh shape, 
+        #if it is intermediate skip to the next iteration
+        if mesh_fn.isIntermediateObject():
+            iterator.next()
             continue
 
-        transform = parents[0]
+       
+        parent_path = om.MDagPath(dag_path)
+        parent_path.pop()
 
-        if transform in seen_transforms:
-            continue
-
-        seen_transforms.add(transform)
-        mesh_transforms.append(transform)
+        transform = parent_path.fullPathName()
+        if transform not in seen_transforms:
+            seen_transforms.add(transform)
+            mesh_transforms.append(transform)
+        
+        iterator.next()
 
     return mesh_transforms
-
 
 def find_naming_nodes(node_type):
     """Return nodes for the selected naming category."""
@@ -1102,32 +1141,37 @@ def find_root_joints():
 
     return roots
 
-
 def find_controllers():
-    """Return unique transforms that own nurbsCurve shapes."""
-    curve_shapes = cmds.ls(type="nurbsCurve", long=True) or []
+    """Return unique transforms that own NURBS curve shapes.(previously used cmds
+       but updated version uses OpenMaya API for better performance)"""
+    iterator = om.MItDag(
+        om.MItDag.kDepthFirst,
+        om.MFn.kNurbsCurve,
+    )
+
     controllers = []
     seen_controllers = set()
 
-    for curve_shape in curve_shapes:
-        parent_transforms = cmds.listRelatives(
-            curve_shape,
-            parent=True,
-            fullPath=True,
-        ) or []
-
-        if not parent_transforms:
+    while not iterator.isDone():
+        dag_path = iterator.getPath()
+        parent_path = om.MDagPath(dag_path)
+        parent_path.pop()
+        #check if the parent has the Transform function set, if not skip to the next iteration
+        if not parent_path.hasFn(om.MFn.kTransform):
+            iterator.next()
             continue
-
-        controller = parent_transforms[0]
+        #get the string representation of the full path name of the parent transform
+        controller = parent_path.fullPathName()
         if controller in seen_controllers:
+            iterator.next()
             continue
 
         seen_controllers.add(controller)
         controllers.append(controller)
 
-    return controllers
+        iterator.next()
 
+    return controllers
 
 def show_rig_validator():
     """Close an old window and display a new validator."""
