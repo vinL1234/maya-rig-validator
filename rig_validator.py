@@ -3,7 +3,9 @@ from maya import OpenMayaUI as omui
 from shiboken6 import wrapInstance
 import maya.cmds as cmds
 import maya.api.OpenMaya as om
+import maya.utils as maya_utils
 import math
+import traceback
 
 
 WINDOW_NAME = "RigValidatorWindow"
@@ -26,6 +28,99 @@ def get_maya_main_window():
     return wrapInstance(int(main_window_ptr), QtWidgets.QWidget)
 
 
+class ScanWorker(QtCore.QObject):
+    """Collect scan data in a worker thread and report progress."""
+
+    progress = QtCore.Signal(int, str)
+    finished = QtCore.Signal(dict)
+    failed = QtCore.Signal(str)
+
+    def __init__(self, options):
+        super().__init__()
+        self.options = options
+        self._cancel_requested = False
+
+    @QtCore.Slot()
+    def run(self):
+        """Run selected checks and emit plain Python data."""
+        try:
+            selected_checks = [
+                key for key in (
+                    "duplicates",
+                    "transforms",
+                    "naming",
+                    "roots",
+                )
+                if self.options.get(key)
+            ]
+
+            total_steps = max(len(selected_checks), 1)
+            completed_steps = 0
+            results = {}
+
+            def update_progress(message):
+                percent = int((completed_steps / total_steps) * 100)
+                self.progress.emit(percent, message)
+
+            if self.options.get("duplicates"):
+                update_progress("Scanning duplicate names...")
+                results["duplicates"] = find_duplicate_names()
+                completed_steps += 1
+                self.progress.emit(
+                    int((completed_steps / total_steps) * 100),
+                    "Duplicate-name scan complete",
+                )
+
+            if self.options.get("transforms"):
+                update_progress("Scanning controller transforms...")
+                results["transforms"] = find_invalid_controller_transforms_data()
+                completed_steps += 1
+                self.progress.emit(
+                    int((completed_steps / total_steps) * 100),
+                    "Controller-transform scan complete",
+                )
+
+            if self.options.get("naming"):
+                update_progress("Scanning naming rules...")
+                node_type = self.options["node_type"]
+                naming_mode = self.options["naming_mode"]
+                prefix = self.options["prefix"]
+                suffix = self.options["suffix"]
+
+                invalid_nodes = []
+                for node in find_naming_nodes(node_type):
+                    short_name = node.split("|")[-1]
+                    if not is_valid_name(
+                        short_name,
+                        naming_mode,
+                        prefix,
+                        suffix,
+                    ):
+                        invalid_nodes.append(node)
+
+                results["naming"] = invalid_nodes
+                completed_steps += 1
+                self.progress.emit(
+                    int((completed_steps / total_steps) * 100),
+                    "Naming-rule scan complete",
+                )
+
+            if self.options.get("roots"):
+                update_progress("Scanning root joints...")
+                results["roots"] = find_root_joints()
+                completed_steps += 1
+                self.progress.emit(
+                    int((completed_steps / total_steps) * 100),
+                    "Root-joint scan complete",
+                )
+
+            self.progress.emit(100, "Building result table...")
+            self.finished.emit(results)
+
+        except Exception:
+            self.failed.emit(traceback.format_exc())
+
+
 class RigValidatorWindow(QtWidgets.QDialog):
 
     def __init__(self, parent=get_maya_main_window()):
@@ -38,6 +133,8 @@ class RigValidatorWindow(QtWidgets.QDialog):
         self.ignore_scene_changes = False
         self.scene_callback_ids = []
         self.watched_node_handles = set()
+        self.scan_thread = None
+        self.scan_worker = None
 
         self.create_widgets()
         self.create_layouts()
@@ -138,6 +235,12 @@ class RigValidatorWindow(QtWidgets.QDialog):
         self.result_label = QtWidgets.QLabel("Scan Results")
         self.status_label = QtWidgets.QLabel("Status: Ready")
 
+        self.scan_progress_bar = QtWidgets.QProgressBar()
+        self.scan_progress_bar.setRange(0, 100)
+        self.scan_progress_bar.setValue(0)
+        self.scan_progress_bar.setFormat("Ready")
+        self.scan_progress_bar.setTextVisible(True)
+
         self.result_table = QtWidgets.QTableWidget()
         self.result_table.setColumnCount(5)
         self.result_table.setHorizontalHeaderLabels(
@@ -219,11 +322,12 @@ class RigValidatorWindow(QtWidgets.QDialog):
         main_layout.addSpacing(8)
         main_layout.addWidget(self.result_label)
         main_layout.addWidget(self.result_table)
+        main_layout.addWidget(self.scan_progress_bar)
         main_layout.addWidget(self.status_label)
 
     def create_connections(self):
         """Connect signals."""
-        self.scan_button.clicked.connect(self.scan_selected)
+        self.scan_button.clicked.connect(self.start_scan)
         self.refresh_button.clicked.connect(self.refresh_results)
         self.apply_fixes_button.clicked.connect(
             self.apply_selected_fixes
@@ -405,11 +509,16 @@ class RigValidatorWindow(QtWidgets.QDialog):
 
     def refresh_results(self):
         """Run the selected checks again and rebuild callbacks."""
-        self.scan_selected()
+        self.start_scan()
 
     def closeEvent(self, event):
-        """Clean up callbacks when the window closes."""
+        """Clean up callbacks and the scan thread when closing."""
         self.remove_scene_callbacks()
+
+        if self.scan_thread is not None and self.scan_thread.isRunning():
+            self.scan_thread.quit()
+            self.scan_thread.wait(2000)
+
         super().closeEvent(event)
 
     def set_all_options(self, checked):
@@ -469,64 +578,151 @@ class RigValidatorWindow(QtWidgets.QDialog):
 
         self.suffix_combo.setCurrentText(default_suffix)
 
-    def scan_selected(self):
-        """Run all selected checks."""
-        selected = []
-        for checkbox in self.scan_checkboxes:
-            if checkbox.isChecked():
-                selected.append(checkbox)
+    def collect_scan_options(self):
+        """Validate the UI and return an immutable scan configuration."""
+        selected = [
+            checkbox for checkbox in self.scan_checkboxes
+            if checkbox.isChecked()
+        ]
 
         if not selected:
             self.status_label.setText(
                 "Status: Please select at least one scan option"
             )
-            return
+            return None
+
+        naming_mode = self.naming_mode_combo.currentText()
+        prefix = self.prefix_combo.currentText().strip()
+        suffix = self.suffix_combo.currentText().strip()
 
         if self.naming_rules_checkbox.isChecked():
-            naming_mode = self.naming_mode_combo.currentText()
-            prefix = self.prefix_combo.currentText().strip()
-            suffix = self.suffix_combo.currentText().strip()
+            if naming_mode in ("Prefix", "Prefix + Suffix") and not prefix:
+                self.status_label.setText("Status: Please enter a prefix")
+                self.prefix_combo.setFocus()
+                return None
 
-            if naming_mode in ("Prefix", "Prefix + Suffix"):
-                if not prefix:
-                    self.status_label.setText(
-                        "Status: Please enter a prefix"
-                    )
-                    self.prefix_combo.setFocus()
-                    return
+            if naming_mode in ("Suffix", "Prefix + Suffix") and not suffix:
+                self.status_label.setText("Status: Please enter a suffix")
+                self.suffix_combo.setFocus()
+                return None
 
-            if naming_mode in ("Suffix", "Prefix + Suffix"):
-                if not suffix:
-                    self.status_label.setText(
-                        "Status: Please enter a suffix"
-                    )
-                    self.suffix_combo.setFocus()
-                    return
+        return {
+            "duplicates": self.duplicate_names_checkbox.isChecked(),
+            "transforms": self.controller_transforms_checkbox.isChecked(),
+            "naming": self.naming_rules_checkbox.isChecked(),
+            "roots": self.root_names_checkbox.isChecked(),
+            "node_type": self.node_type_combo.currentText(),
+            "naming_mode": naming_mode,
+            "prefix": prefix,
+            "suffix": suffix,
+        }
+
+    def set_scan_ui_enabled(self, enabled):
+        """Enable or disable controls while a scan is running."""
+        self.scan_button.setEnabled(enabled)
+        self.refresh_button.setEnabled(enabled and self.results_are_stale)
+        self.apply_fixes_button.setEnabled(enabled and not self.results_are_stale)
+        self.options_group.setEnabled(enabled)
+
+    def start_scan(self):
+        """Create a worker thread and begin an asynchronous scan."""
+        if self.scan_thread is not None and self.scan_thread.isRunning():
+            self.status_label.setText("Status: A scan is already running")
+            return
+
+        options = self.collect_scan_options()
+        if options is None:
+            return
 
         self.ignore_scene_changes = True
-        try:
-            self.result_table.setRowCount(0)
-            total_issues = 0
+        self.result_table.setRowCount(0)
+        self.scan_progress_bar.setValue(0)
+        self.scan_progress_bar.setFormat("Starting scan... %p%")
+        self.status_label.setText("Status: Scanning...")
+        self.set_scan_ui_enabled(False)
 
-            if self.duplicate_names_checkbox.isChecked():
-                total_issues += self.append_duplicate_name_results()
-            if self.controller_transforms_checkbox.isChecked():
-                total_issues += self.append_transform_results()
-            if self.naming_rules_checkbox.isChecked():
-                total_issues += self.append_naming_rule_results()
-            if self.root_names_checkbox.isChecked():
-                total_issues += self.append_root_joint_results()
-        finally:
-            self.ignore_scene_changes = False
+        self.scan_thread = QtCore.QThread(self)
+        self.scan_worker = ScanWorker(options)
+        self.scan_worker.moveToThread(self.scan_thread)
+
+        self.scan_thread.started.connect(self.scan_worker.run)
+        self.scan_worker.progress.connect(self.on_scan_progress)
+        self.scan_worker.finished.connect(self.on_scan_finished)
+        self.scan_worker.failed.connect(self.on_scan_failed)
+
+        self.scan_worker.finished.connect(self.scan_thread.quit)
+        self.scan_worker.failed.connect(self.scan_thread.quit)
+        self.scan_worker.finished.connect(self.scan_worker.deleteLater)
+        self.scan_worker.failed.connect(self.scan_worker.deleteLater)
+        self.scan_thread.finished.connect(self.scan_thread.deleteLater)
+        self.scan_thread.finished.connect(self.clear_scan_thread_references)
+
+        self.scan_thread.start()
+
+    @QtCore.Slot(int, str)
+    def on_scan_progress(self, percent, message):
+        """Update progress widgets in Maya's main Qt thread."""
+        self.scan_progress_bar.setValue(percent)
+        self.scan_progress_bar.setFormat(f"{message}  %p%")
+        self.status_label.setText(f"Status: {message}")
+
+    @QtCore.Slot(dict)
+    def on_scan_finished(self, results):
+        """Build the table from worker results in the main thread."""
+        total_issues = 0
+
+        if "duplicates" in results:
+            total_issues += self.append_duplicate_name_results(
+                results["duplicates"]
+            )
+        if "transforms" in results:
+            total_issues += self.append_transform_results(
+                results["transforms"]
+            )
+        if "naming" in results:
+            total_issues += self.append_naming_rule_results(
+                results["naming"]
+            )
+        if "roots" in results:
+            total_issues += self.append_root_joint_results(
+                results["roots"]
+            )
 
         self.results_are_stale = False
+        self.ignore_scene_changes = False
         self.refresh_button.setEnabled(False)
         self.apply_fixes_button.setEnabled(True)
+        self.options_group.setEnabled(True)
+        self.scan_button.setEnabled(True)
         self.register_result_name_callbacks()
 
+        self.scan_progress_bar.setValue(100)
+        self.scan_progress_bar.setFormat("Scan complete  %p%")
         self.status_label.setText(
             f"Status: Scan complete - {total_issues} issue(s) found"
         )
+
+    @QtCore.Slot(str)
+    def on_scan_failed(self, error_text):
+        """Restore the UI and report an unexpected worker error."""
+        self.ignore_scene_changes = False
+        self.options_group.setEnabled(True)
+        self.scan_button.setEnabled(True)
+        self.apply_fixes_button.setEnabled(False)
+        self.scan_progress_bar.setValue(0)
+        self.scan_progress_bar.setFormat("Scan failed")
+        self.status_label.setText("Status: Scan failed. See Script Editor.")
+        cmds.warning(error_text)
+
+    @QtCore.Slot()
+    def clear_scan_thread_references(self):
+        """Drop Python references after Qt has stopped the thread."""
+        self.scan_worker = None
+        self.scan_thread = None
+
+    def scan_selected(self):
+        """Compatibility wrapper for older calls in this class."""
+        self.start_scan()
 
     def make_item_read_only(self, item):
         """Remove editing from a table item."""
@@ -628,9 +824,10 @@ class RigValidatorWindow(QtWidgets.QDialog):
         item.setFont(font)
         self.result_table.setItem(row, 0, item)
 
-    def append_duplicate_name_results(self):
+    def append_duplicate_name_results(self, duplicates=None):
         """Add duplicate names with editable default fixes."""
-        duplicates = find_duplicate_names()
+        if duplicates is None:
+            duplicates = find_duplicate_names()
         count = 0
 
         for paths in duplicates.values():
@@ -659,9 +856,10 @@ class RigValidatorWindow(QtWidgets.QDialog):
 
         return count
 
-    def append_transform_results(self):
+    def append_transform_results(self, invalid_controllers=None):
         """Add controllers whose transforms are not at defaults."""
-        invalid_controllers = self.find_invalid_controller_transforms()
+        if invalid_controllers is None:
+            invalid_controllers = find_invalid_controller_transforms_data()
         self.add_section(
             "Invalid Controller Transforms",
             len(invalid_controllers),
@@ -684,25 +882,26 @@ class RigValidatorWindow(QtWidgets.QDialog):
 
         return len(invalid_controllers)
 
-    def append_naming_rule_results(self):
+    def append_naming_rule_results(self, invalid_nodes=None):
         """Add naming-rule results for controllers, meshes, or joints."""
         node_type = self.node_type_combo.currentText()
         naming_mode = self.naming_mode_combo.currentText()
         prefix = self.prefix_combo.currentText().strip()
         suffix = self.suffix_combo.currentText().strip()
 
-        invalid_nodes = []
+        if invalid_nodes is None:
+            invalid_nodes = []
 
-        for node in find_naming_nodes(node_type):
-            short_name = node.split("|")[-1]
+            for node in find_naming_nodes(node_type):
+                short_name = node.split("|")[-1]
 
-            if not is_valid_name(
-                short_name,
-                naming_mode,
-                prefix,
-                suffix,
-            ):
-                invalid_nodes.append(node)
+                if not is_valid_name(
+                    short_name,
+                    naming_mode,
+                    prefix,
+                    suffix,
+                ):
+                    invalid_nodes.append(node)
 
         section_title = f"Invalid {node_type}s"
         self.add_section(section_title, len(invalid_nodes))
@@ -734,9 +933,10 @@ class RigValidatorWindow(QtWidgets.QDialog):
 
         return len(invalid_nodes)
 
-    def append_root_joint_results(self):
+    def append_root_joint_results(self, root_joints=None):
         """Display root-joint results without automatic fixes."""
-        root_joints = find_root_joints()
+        if root_joints is None:
+            root_joints = find_root_joints()
 
         if len(root_joints) == 1:
             issue_count = 0
@@ -923,11 +1123,11 @@ class RigValidatorWindow(QtWidgets.QDialog):
             cmds.undoInfo(closeChunk=True)
             self.ignore_scene_changes = False
 
-        # Rescan to refresh paths and remove resolved rows.
-        self.scan_selected()
+        # Start a fresh asynchronous scan to rebuild paths/results.
         self.status_label.setText(
-            f"Status: {success_count} fixed, {failed_count} failed"
+            f"Status: {success_count} fixed, {failed_count} failed. Rescanning..."
         )
+        self.start_scan()
 
     def apply_one_fix(self, fix_data):
         """Apply one selected fix."""
@@ -1140,6 +1340,45 @@ def find_root_joints():
         iterator.next()
 
     return roots
+
+def find_invalid_controller_transforms_data():
+    """Return controller transform errors as plain Python data."""
+    invalid_controllers = {}
+    tolerance = 1e-6
+
+    for controller in find_controllers():
+        selection = om.MSelectionList()
+        selection.add(controller)
+        controller_path = selection.getDagPath(0)
+        transform_fn = om.MFnTransform(controller_path)
+
+        translation = transform_fn.translation(om.MSpace.kTransform)
+        rotation = transform_fn.rotation()
+        scale = transform_fn.scale()
+
+        errors = []
+        values = (
+            ("translateX", translation.x, 0.0, False),
+            ("translateY", translation.y, 0.0, False),
+            ("translateZ", translation.z, 0.0, False),
+            ("rotateX", rotation.x, 0.0, True),
+            ("rotateY", rotation.y, 0.0, True),
+            ("rotateZ", rotation.z, 0.0, True),
+            ("scaleX", scale[0], 1.0, False),
+            ("scaleY", scale[1], 1.0, False),
+            ("scaleZ", scale[2], 1.0, False),
+        )
+
+        for attribute, value, expected, convert_to_degrees in values:
+            if not math.isclose(value, expected, abs_tol=tolerance):
+                shown_value = math.degrees(value) if convert_to_degrees else value
+                errors.append(f"{attribute} = {shown_value:.6f}")
+
+        if errors:
+            invalid_controllers[controller] = errors
+
+    return invalid_controllers
+
 
 def find_controllers():
     """Return unique transforms that own NURBS curve shapes.(previously used cmds
